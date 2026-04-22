@@ -210,22 +210,36 @@ def auth(svr="prod", product=_cfg["my_prod"], url=None):
 
     # 기존 발급된 토큰이 있는지 확인
     saved_token = read_token()  # 기존 발급 토큰 확인
-    # print("saved_token: ", saved_token)
     if saved_token is None:  # 기존 발급 토큰 확인이 안되면 발급처리
-        url = f"{_cfg[svr]}/oauth2/tokenP"
-        res = requests.post(
-            url, data=json.dumps(p), headers=_getBaseHeader()
-        )  # 토큰 발급
-        rescode = res.status_code
-        if rescode == 200:  # 토큰 정상 발급
-            my_token = _getResultObject(res.json()).access_token  # 토큰값 가져오기
-            my_expired = _getResultObject(
-                res.json()
-            ).access_token_token_expired  # 토큰값 만료일시 가져오기
-            save_token(my_token, my_expired)  # 새로 발급 받은 토큰 저장
-        else:
-            print("Get Authentification token fail!\nYou have to restart your app!!!")
-            return
+        token_url = f"{_cfg[svr]}/oauth2/tokenP"
+        my_token = None
+        last_err = None
+        # KIS rate-limits token issuance (EGW00133 = 1-min cooldown). Retry with backoff
+        # so a transient conflict with a concurrent auth doesn't poison the whole run.
+        for attempt in range(3):
+            try:
+                res = requests.post(
+                    token_url, data=json.dumps(p), headers=_getBaseHeader(), timeout=10
+                )
+            except requests.RequestException as exc:
+                last_err = f"request exception: {exc}"
+                time.sleep(5 * (attempt + 1))
+                continue
+
+            if res.status_code == 200:
+                my_token = _getResultObject(res.json()).access_token
+                my_expired = _getResultObject(res.json()).access_token_token_expired
+                save_token(my_token, my_expired)
+                break
+
+            last_err = f"HTTP {res.status_code}: {res.text[:200]}"
+            delay = 65 if "EGW00133" in res.text else 5 * (attempt + 1)
+            time.sleep(delay)
+
+        if my_token is None:
+            raise RuntimeError(
+                f"KIS token request failed after 3 attempts (svr={svr}): {last_err}"
+            )
     else:
         my_token = saved_token  # 기존 발급 토큰 확인되어 기존 토큰 사용
 
